@@ -76,8 +76,8 @@ public final class FindBreakpointEvidenceSparkUnitTest extends BaseTest {
                 .forEach(qNameMultiMap::add);
         final HopscotchUniqueMultiMap<SVKmer, Integer, FindBreakpointEvidenceSpark.KmerAndInterval> actualKmerAndIntervalSet =
                 new HopscotchUniqueMultiMap<>(
-                        FindBreakpointEvidenceSpark.getKmerIntervals(params, ctx, qNameMultiMap, new HopscotchSet<>(0),
-                                reads, locations, null));
+                        FindBreakpointEvidenceSpark.getKmerIntervals(params, ctx, qNameMultiMap, 1, new HopscotchSet<>(0),
+                                reads, locations, null)._2());
         final Set<SVKmer> expectedKmers = SVUtils.readKmersFile(params.kSize, kmersFile, null);
         Assert.assertEquals(expectedKmers.size(), actualKmerAndIntervalSet.size());
         for ( final FindBreakpointEvidenceSpark.KmerAndInterval kmerAndInterval : actualKmerAndIntervalSet ) {

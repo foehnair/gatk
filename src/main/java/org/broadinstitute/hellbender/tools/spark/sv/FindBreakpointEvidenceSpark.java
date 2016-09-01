@@ -40,24 +40,9 @@ public final class FindBreakpointEvidenceSpark extends GATKSparkTool {
     private static final long serialVersionUID = 1L;
 
     //--------- parameters ----------
-    @VisibleForTesting static final Params defaultParams =
-            new Params(
-                    SVConstants.KMER_SIZE,   // kmer size
-                    SVConstants.MIN_ENTROPY, // minimum kmer entropy
-                    20,                      // minimum map quality for evidential reads
-                    45,                      // minimum match length
-                    1000,                    // maximum coverage on breakpoint interval
-                    15,                      // minimum number of evidentiary reads in called cluster
-                    3,                       // maximum number of intervals a localizing kmer can appear in
-                    3,                       // KmerCleaner min kmer count
-                    125,                     // KmerCleaner max kmer count
-                    600000,                  // KmerCleaner guess for number of unique error-free kmers per partition
-                    500,                     // maximum template names for an assembly kmer
-                    250000,                  // guess for unique, error-free, scrubbed kmers per assembly partition
-                    7,                       // guess for ratio of total reads in assembly to evidentiary reads in interval
-                    100000000,               // maximum FASTQ size
-                    0                        // exclusion interval extra padding
-            );
+
+    // no-arg constructor for Params object establishes default values
+    @VisibleForTesting static final Params defaultParams = new Params();
 
     @Argument(doc = "Kmer size.", fullName = "kSize")
     private int kSize = defaultParams.kSize;
@@ -81,6 +66,9 @@ public final class FindBreakpointEvidenceSpark extends GATKSparkTool {
     @Argument(doc = "Minimum number of reads in cluster to declare an interval of interest.",
             fullName = "minEvidenceCount")
     private int minEvidenceCount = defaultParams.minEvidenceCount;
+
+    @Argument(doc = "Minimum number of localizing kmers in a valid interval.", fullName="minKmersPerInterval")
+    private int minKmersPerInterval = defaultParams.minKmersPerInterval;
 
     @Argument(doc = "KmerCleaner maximum number of intervals for a localizing kmer.", fullName = "cleanerMaxIntervals")
     private int cleanerMaxIntervals = defaultParams.cleanerMaxIntervals;
@@ -175,9 +163,10 @@ public final class FindBreakpointEvidenceSpark extends GATKSparkTool {
                 new Locations(metadataFile, evidenceDir, intervalFile, qNamesMappedFile,
                                 kmerFile, qNamesAssemblyFile, exclusionIntervalsFile);
         final Params params =
-                new Params(kSize, minEntropy, minEvidenceMapQ, minEvidenceMatchLength, maxIntervalCoverage, minEvidenceCount,
-                            cleanerMaxIntervals, cleanerMinKmerCount, cleanerMaxKmerCount, cleanerKmersPerPartitionGuess,
-                            maxQNamesPerKmer, assemblyKmerMapSize, assemblyToMappedSizeRatioGuess, maxFASTQSize, exclusionIntervalPadding);
+                new Params(kSize, minEntropy, minEvidenceMapQ, minEvidenceMatchLength, maxIntervalCoverage,
+                            minEvidenceCount, minKmersPerInterval, cleanerMaxIntervals, cleanerMinKmerCount,
+                            cleanerMaxKmerCount, cleanerKmersPerPartitionGuess, maxQNamesPerKmer, assemblyKmerMapSize,
+                            assemblyToMappedSizeRatioGuess, maxFASTQSize, exclusionIntervalPadding);
 
         final PipelineOptions pipelineOptions = getAuthenticatedGCSOptions();
         final JavaRDD<GATKRead> unfilteredReads = getUnfilteredReads();
@@ -193,16 +182,18 @@ public final class FindBreakpointEvidenceSpark extends GATKSparkTool {
         final HopscotchUniqueMultiMap<String, Integer, QNameAndInterval> qNamesMultiMap = intervalsAndQNameMap._2;
 
         // supplement the template names with other reads that share kmers
-        if ( !intervalOnlyAssembly )
-            addAssemblyQNames(params, ctx, kmersToIgnoreFile, qNamesMultiMap, allPrimaryLines, locations, pipelineOptions);
+        final List<Tuple2<Integer, String>> intervalDispositions;
+        if ( intervalOnlyAssembly ) intervalDispositions = new ArrayList<>();
+        else intervalDispositions = addAssemblyQNames(params, ctx, kmersToIgnoreFile, qNamesMultiMap, intervals.size(),
+                                                        allPrimaryLines, locations, pipelineOptions);
 
         // write a FASTQ file for each interval
         final String outDir = outputDir;
         final int maxFastqSize = maxFASTQSize;
         final boolean includeMapLoc = includeMappingLocation;
-        final List<Tuple2<Integer, String>> intervalDispositions =
+        intervalDispositions.addAll(
                 generateFastqs(ctx, qNamesMultiMap, allPrimaryLines, intervals.size(), includeMapLoc,
-                                intervalAndFastqBytes -> writeFastq(intervalAndFastqBytes, outDir, maxFastqSize));
+                                intervalAndFastqBytes -> writeFastq(intervalAndFastqBytes, outDir, maxFastqSize)));
 
         // record the intervals
         if ( locations.intervalFile != null ) {
@@ -322,11 +313,12 @@ public final class FindBreakpointEvidenceSpark extends GATKSparkTool {
      * get the template names of all reads sharing these kmers (regardless of where or if they're mapped),
      * and add these template names to the set of names for each interval.
      */
-    private void addAssemblyQNames(
+    private List<Tuple2<Integer, String>> addAssemblyQNames(
             final Params params,
             final JavaSparkContext ctx,
             final String kmersToIgnoreFile,
             final HopscotchUniqueMultiMap<String, Integer, QNameAndInterval> qNamesMultiMap,
+            final int nIntervals,
             final JavaRDD<GATKRead> allPrimaryLines,
             final Locations locations,
             final PipelineOptions pipelineOptions )
@@ -334,12 +326,14 @@ public final class FindBreakpointEvidenceSpark extends GATKSparkTool {
         final JavaRDD<GATKRead> goodPrimaryLines =
                 allPrimaryLines.filter(read -> !read.isDuplicate() && !read.failsVendorQualityCheck());
 
+        final Tuple2<List<Tuple2<Integer, String>>, HopscotchUniqueMultiMap<SVKmer, Integer, KmerAndInterval>> kmerIntervalsAndDispositions =
+                getKmerAndIntervalsSet(params, ctx, kmersToIgnoreFile, qNamesMultiMap, nIntervals,
+                                        goodPrimaryLines, locations, pipelineOptions);
         qNamesMultiMap.addAll(
                 getAssemblyQNames(
                         params,
                         ctx,
-                        getKmerAndIntervalsSet(params, ctx, kmersToIgnoreFile, qNamesMultiMap,
-                                                goodPrimaryLines, locations, pipelineOptions),
+                        kmerIntervalsAndDispositions._2(),
                         goodPrimaryLines));
 
         if ( locations.qNamesAssemblyFile != null ) {
@@ -347,18 +341,20 @@ public final class FindBreakpointEvidenceSpark extends GATKSparkTool {
         }
 
         log("Discovered "+qNamesMultiMap.size()+" unique template names for assembly.");
+        return kmerIntervalsAndDispositions._1();
     }
 
     /**
      * Kmerize reads having template names in a given set,
-     * filter out kmers that appear too often in this read set or in the genome to be helpful in localizing reads,
+     * filter out low complexity kmers and kmers that appear too often in the genome to be helpful in localizing reads,
      * and return the set of kmers that appear in each interval.
      */
-    private HopscotchUniqueMultiMap<SVKmer, Integer, KmerAndInterval> getKmerAndIntervalsSet(
+    private Tuple2<List<Tuple2<Integer, String>>, HopscotchUniqueMultiMap<SVKmer, Integer, KmerAndInterval>> getKmerAndIntervalsSet(
             final Params params,
             final JavaSparkContext ctx,
             final String kmersToIgnoreFile,
             final HopscotchUniqueMultiMap<String, Integer, QNameAndInterval> qNamesMultiMap,
+            final int nIntervals,
             final JavaRDD<GATKRead> goodPrimaryLines,
             final Locations locations,
             final PipelineOptions pipelineOptions )
@@ -366,12 +362,14 @@ public final class FindBreakpointEvidenceSpark extends GATKSparkTool {
         final Set<SVKmer> kmerKillSet = SVUtils.readKmersFile(params.kSize, kmersToIgnoreFile, pipelineOptions);
         log("Ignoring " + kmerKillSet.size() + " genomically common kmers.");
 
+        final Tuple2<List<Tuple2<Integer, String>>, List<KmerAndInterval>> kmerIntervalsAndDispositions =
+                getKmerIntervals(params, ctx, qNamesMultiMap, nIntervals, kmerKillSet, goodPrimaryLines, locations, pipelineOptions);
         final HopscotchUniqueMultiMap<SVKmer, Integer, KmerAndInterval> kmerMultiMap =
-                new HopscotchUniqueMultiMap<>(
-                    getKmerIntervals(params, ctx, qNamesMultiMap, kmerKillSet, goodPrimaryLines, locations, pipelineOptions));
+                new HopscotchUniqueMultiMap<>(kmerIntervalsAndDispositions._2());
         log("Discovered " + kmerMultiMap.size() + " kmers.");
 
-        return kmerMultiMap;
+        return new Tuple2<List<Tuple2<Integer, String>>, HopscotchUniqueMultiMap<SVKmer, Integer, KmerAndInterval>>(
+                kmerIntervalsAndDispositions._1(), kmerMultiMap);
     }
 
     /**
@@ -462,10 +460,11 @@ public final class FindBreakpointEvidenceSpark extends GATKSparkTool {
     }
 
     /** find kmers for each interval */
-    @VisibleForTesting static List<KmerAndInterval> getKmerIntervals(
+    @VisibleForTesting static Tuple2<List<Tuple2<Integer, String>>, List<KmerAndInterval>> getKmerIntervals(
             final Params params,
             final JavaSparkContext ctx,
             final HopscotchUniqueMultiMap<String, Integer, QNameAndInterval> qNamesMultiMap,
+            final int nIntervals,
             final Set<SVKmer> kmerKillSet,
             final JavaRDD<GATKRead> reads,
             final Locations locations,
@@ -496,11 +495,33 @@ public final class FindBreakpointEvidenceSpark extends GATKSparkTool {
         broadcastQNameAndIntervalsMultiMap.destroy();
         broadcastKmerKillSet.destroy();
 
+        final int[] intervalKmerCounts = new int[nIntervals];
+        for ( final KmerAndInterval kmerAndInterval : kmerIntervals ) {
+            intervalKmerCounts[kmerAndInterval.getIntervalId()] += 1;
+        }
+        final Set<Integer> intervalsToKill = new HashSet<>();
+        final List<Tuple2<Integer, String>> intervalDispositions = new ArrayList<>();
+        for ( int idx = 0; idx != nIntervals; ++idx ) {
+            if ( intervalKmerCounts[idx] < params.minKmersPerInterval ) {
+                intervalsToKill.add(idx);
+                intervalDispositions.add(new Tuple2<>(idx, "FASTQ not written -- too few kmers"));
+            }
+        }
+
+        final Iterator<QNameAndInterval> itr = qNamesMultiMap.iterator();
+        while ( itr.hasNext() ) {
+            if ( intervalsToKill.contains(itr.next().getIntervalId()) ) itr.remove();
+        }
+
+        final List<KmerAndInterval> filteredKmerIntervals = kmerIntervals.stream()
+                .filter(kmerAndInterval -> !intervalsToKill.contains(kmerAndInterval.getIntervalId()))
+                .collect(SVUtils.arrayListCollector(kmerIntervals.size()));
+
         // record the kmers with their interval IDs
         if ( locations.kmerFile != null ) {
             try (final OutputStreamWriter writer = new OutputStreamWriter(new BufferedOutputStream(
                     BucketUtils.createFile(locations.kmerFile, pipelineOptions)))) {
-                for (final KmerAndInterval kmerAndInterval : kmerIntervals) {
+                for (final KmerAndInterval kmerAndInterval : filteredKmerIntervals) {
                     writer.write(kmerAndInterval.toString(kSize) + " " + kmerAndInterval.getIntervalId() + "\n");
                 }
             } catch (final IOException ioe) {
@@ -508,7 +529,7 @@ public final class FindBreakpointEvidenceSpark extends GATKSparkTool {
             }
         }
 
-        return kmerIntervals;
+        return new Tuple2<List<Tuple2<Integer, String>>, List<KmerAndInterval>>(intervalDispositions, filteredKmerIntervals);
     }
 
     private List<SVInterval> removeIntervalsNearGapsAndLog( final List<SVInterval> intervals,
@@ -727,6 +748,7 @@ public final class FindBreakpointEvidenceSpark extends GATKSparkTool {
         public final int minEvidenceMatchLength;
         public final int maxIntervalCoverage;
         public final int minEvidenceCount;
+        public final int minKmersPerInterval;
         public final int cleanerMaxIntervals;
         public final int cleanerMinKmerCount;
         public final int cleanerMaxKmerCount;
@@ -737,18 +759,38 @@ public final class FindBreakpointEvidenceSpark extends GATKSparkTool {
         public final int maxFASTQSize;
         public final int exclusionIntervalPadding;
 
+        public Params() {
+            kSize = SVConstants.KMER_SIZE;          // kmer size
+            minEntropy = SVConstants.MIN_ENTROPY;   // minimum kmer entropy
+            minEvidenceMapQ = 20;                   // minimum map quality for evidential reads
+            minEvidenceMatchLength = 45;            // minimum match length
+            maxIntervalCoverage = 1000;             // maximum coverage on breakpoint interval
+            minEvidenceCount = 15;                  // minimum number of evidentiary reads in called cluster
+            minKmersPerInterval = 20;               // minimum number of good kmers in a valid interval
+            cleanerMaxIntervals = 3;                // KmerCleaner maximum number of intervals a localizing kmer can appear in
+            cleanerMinKmerCount = 3;                // KmerCleaner min kmer count
+            cleanerMaxKmerCount = 125;              // KmerCleaner max kmer count
+            cleanerKmersPerPartitionGuess = 600000; // KmerCleaner guess for number of unique error-free kmers per partition
+            maxQNamesPerKmer = 500;                 // maximum template names for an assembly kmer
+            assemblyKmerMapSize = 250000;           // guess for unique, error-free, scrubbed kmers per assembly partition
+            assemblyToMappedSizeRatioGuess = 7;     // guess for ratio of total reads in assembly to evidentiary reads in interval
+            maxFASTQSize = 10000000;                // maximum FASTQ size
+            exclusionIntervalPadding = 0;           // exclusion interval extra padding
+        }
+
         public Params( final int kSize, final double minEntropy, final int minEvidenceMapQ,
                        final int minEvidenceMatchLength, final int maxIntervalCoverage, final int minEvidenceCount,
-                       final int cleanerMaxIntervals, final int cleanerMinKmerCount,
+                       final int minKmersPerInterval, final int cleanerMaxIntervals, final int cleanerMinKmerCount,
                        final int cleanerMaxKmerCount, final int cleanerKmersPerPartitionGuess,
-                       final int maxQNamesPerKmer, final int asemblyKmerMapSize, final int assemblyToMappedSizeRatioGuess, final int maxFASTQSize,
-                       final int exclusionIntervalPadding ) {
+                       final int maxQNamesPerKmer, final int asemblyKmerMapSize, final int assemblyToMappedSizeRatioGuess,
+                       final int maxFASTQSize, final int exclusionIntervalPadding ) {
             this.kSize = kSize;
             this.minEntropy = minEntropy;
             this.minEvidenceMapQ = minEvidenceMapQ;
             this.minEvidenceMatchLength = minEvidenceMatchLength;
             this.maxIntervalCoverage = maxIntervalCoverage;
             this.minEvidenceCount = minEvidenceCount;
+            this.minKmersPerInterval = minKmersPerInterval;
             this.cleanerMaxIntervals = cleanerMaxIntervals;
             this.cleanerMinKmerCount = cleanerMinKmerCount;
             this.cleanerMaxKmerCount = cleanerMaxKmerCount;
@@ -1243,7 +1285,6 @@ public final class FindBreakpointEvidenceSpark extends GATKSparkTool {
         private final int nReadsPerInterval;
         private final boolean includeMappingLocation;
 
-        @SuppressWarnings("unchecked")
         ReadsForQNamesFinder( final HopscotchUniqueMultiMap<String, Integer, QNameAndInterval> qNamesMultiMap,
                               final int nIntervals, final boolean includeMappingLocation ) {
             this.qNamesMultiMap = qNamesMultiMap;
